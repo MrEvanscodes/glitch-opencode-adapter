@@ -6,8 +6,13 @@
  *     uv run --no-project --directory <root>/.claude/scripts python <bridgePath> <mode>
  *
  * The JSON payload goes on stdin; stdout is the bridge's contract: nothing (allowed / no context /
- * inert) or ONE JSON object `{deny}` (pre) | `{note}` (post) | `{context}` (session, prompt) |
- * `{error}` (any mode: an allow plus a visible failure).
+ * inert / a chat staged or rightly left alone for `capture`) or ONE JSON object `{deny}` (pre) |
+ * `{note}` (post) | `{context}` (prompt) | `{context, date?, timezone?}` (session: a non-empty
+ * context plus the engine's local build date "YYYY-MM-DD", left out only when its clock was
+ * unreadable, and the IANA name of the zone that date is in, left out when it has none) |
+ * `{error}` (any mode, `capture` included: an allow plus a visible failure). Every other mode
+ * answers with exactly one key. `capture` has no result object of its own: anything but empty
+ * or `{error}` is bad output.
  *
  * Every failure returns `{ok:false, reason}` and is recorded through `failure.record` (log line +
  * one pending notice for the session). Reasons are fixed short strings; they never contain the
@@ -22,7 +27,7 @@ import { basename, join } from "node:path";
 
 import { cleanReason, record } from "./failure.ts";
 
-export type Mode = "pre" | "post" | "session" | "prompt";
+export type Mode = "pre" | "post" | "session" | "prompt" | "capture";
 
 export interface DenyResult {
   deny: { kind: string; member: string; model: string };
@@ -32,6 +37,10 @@ export interface NoteResult {
 }
 export interface ContextResult {
   context: string;
+  /** `session` only: the engine's local build date "YYYY-MM-DD"; absent when its clock was unreadable. */
+  date?: string;
+  /** `session` only: the IANA zone of that date (e.g. "Europe/London"); absent when it has no name. */
+  timezone?: string;
 }
 export type BridgeResult = DenyResult | NoteResult | ContextResult;
 
@@ -61,6 +70,7 @@ export const DEFAULT_TIMEOUTS: Readonly<Record<Mode, number>> = Object.freeze({
   post: 10_000,
   session: 30_000,
   prompt: 10_000,
+  capture: 10_000,
 });
 
 export const BRIDGE_OVERRIDE_ENV = "GLITCH_OPENCODE_BRIDGE_OVERRIDE";
@@ -68,7 +78,7 @@ export const BRIDGE_OVERRIDE_ENV = "GLITCH_OPENCODE_BRIDGE_OVERRIDE";
 /** stdout larger than this is not the bridge talking: treated as bad output. */
 export const MAX_STDOUT_BYTES = 8 * 1024 * 1024;
 
-const MODES: readonly Mode[] = ["pre", "post", "session", "prompt"];
+const MODES: readonly Mode[] = ["pre", "post", "session", "prompt", "capture"];
 
 /** The default argv: `run --no-project --directory <root>/.claude/scripts python <bridge> <mode>`. */
 export const uvArgs: ArgsBuilder = (root, bridgePath, mode) => [
@@ -134,6 +144,7 @@ export function parseBridgeOutput(stdout: string, mode: Mode): Parsed {
   }
   if (!isPlainObject(value)) return { kind: "bad" };
   const keys = Object.keys(value);
+  if (mode === "session" && keys.includes("context")) return parseSession(value, keys);
   if (keys.length !== 1) return { kind: "bad" };
   const key = keys[0];
   const body = value[key];
@@ -150,10 +161,44 @@ export function parseBridgeOutput(stdout: string, mode: Mode): Parsed {
   if (key === "note" && mode === "post" && typeof body === "string") {
     return { kind: "result", result: body === "" ? null : { note: body } };
   }
-  if (key === "context" && (mode === "session" || mode === "prompt") && typeof body === "string") {
+  if (key === "context" && mode === "prompt" && typeof body === "string") {
     return { kind: "result", result: body === "" ? null : { context: body } };
   }
   return { kind: "bad" };
+}
+
+const SESSION_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * A plausible IANA zone name: "UTC", "Area/Location", "Area/Sub/Location", "Etc/GMT+5". Letters,
+ * digits, `_`, `+`, `-` in each part, parts joined by single slashes, 64 characters at most.
+ * Shape only: whether the host's Intl data knows the zone is translate.localDay's business.
+ */
+const SESSION_TIMEZONE_RE = /^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+){0,2}$/;
+const SESSION_TIMEZONE_MAX = 64;
+
+/**
+ * The `session` answer: `{context}` plus, each optional, `date` and `timezone`. `context` is a
+ * non-empty string (the bridge answers silence, not an empty context, when there is nothing to
+ * say); `date`, when present, is "YYYY-MM-DD"; `timezone`, when present, is a plausible IANA name.
+ * Any other key, a wrong type, a malformed value or an empty context is bad output.
+ */
+function parseSession(value: Record<string, unknown>, keys: string[]): Parsed {
+  if (!keys.every((k) => k === "context" || k === "date" || k === "timezone")) return { kind: "bad" };
+  const { context, date, timezone } = value;
+  if (typeof context !== "string" || context === "") return { kind: "bad" };
+  const result: ContextResult = { context };
+  if ("date" in value) {
+    if (typeof date !== "string" || !SESSION_DATE_RE.test(date)) return { kind: "bad" };
+    result.date = date;
+  }
+  if ("timezone" in value) {
+    if (typeof timezone !== "string" || timezone.length > SESSION_TIMEZONE_MAX || !SESSION_TIMEZONE_RE.test(timezone)) {
+      return { kind: "bad" };
+    }
+    result.timezone = timezone;
+  }
+  return { kind: "result", result };
 }
 
 function killTree(child: ReturnType<typeof spawn>): void {
@@ -185,7 +230,7 @@ function sessionOf(payload: unknown): string | undefined {
 export function callBridge(root: string, mode: Mode, payload: unknown, opts: CallOptions = {}): Promise<BridgeOutcome> {
   const sessionId = opts.sessionId ?? sessionOf(payload);
   const fail = (reason: string): BridgeOutcome => {
-    const clean = record(reason, sessionId, { logPath: opts.logPath });
+    const clean = record(reason, sessionId, { logPath: opts.logPath, kind: mode === "capture" ? "capture" : "guards" });
     return { ok: false, reason: clean };
   };
 

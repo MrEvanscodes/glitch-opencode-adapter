@@ -26,15 +26,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 import codex_shared
+import config
+import pytest
+import shared
+
+import capture
+import chatcache
+import chatsource
 import context
 import opencode_bridge
 import posttool
 import pretool
-import shared
 from conftest import BRIDGE_DIR, GLITCH_ROOT, SCRIPTS_DIR
+from test_capture import Fake, _new_ms
 
 R = str(GLITCH_ROOT)
 BRIDGE = BRIDGE_DIR / "opencode_bridge.py"
@@ -63,7 +68,19 @@ def _payload(mode: str, session_dir: str) -> dict[str, Any]:
                 "session_dir": session_dir}
     if mode == "session":
         return {"session_id": "ses_entry", "session_dir": session_dir}
+    if mode == "capture":
+        return {"session_id": "ses_entry", "session_dir": session_dir, "reason": "turn"}
     return {"session_id": "ses_entry", "prompt": "hello", "session_dir": session_dir}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_opencode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The session start now sweeps: never let it (or a capture call) reach the real opencode.
+
+    An absolute path to nothing reads as "not installed" (unreachable); a test that wants a store
+    installs the fake binary over it.
+    """
+    monkeypatch.setenv(chatsource.BIN_ENV, str(tmp_path / "no-opencode-here"))
 
 
 def _spawn(mode: str, data: dict[str, Any] | bytes, cwd: Path = SCRIPTS_DIR,
@@ -72,20 +89,21 @@ def _spawn(mode: str, data: dict[str, Any] | bytes, cwd: Path = SCRIPTS_DIR,
     if UV is None:  # pragma: no cover - uv is how the whole suite runs
         pytest.skip("uv not on PATH")
     raw = data if isinstance(data, bytes) else _BOM + json.dumps(data).encode("utf-8")
-    return subprocess.run(  # noqa: S603 - fixed argv, no shell
+    return subprocess.run(  # fixed argv, no shell
         [UV, "run", "--no-project", "--directory", str(directory), "python", str(BRIDGE), mode],
         input=raw, capture_output=True, env=dict(os.environ), cwd=str(cwd), timeout=120,
         check=False,
     )
 
 
-def _one_json(stdout: bytes) -> dict[str, Any]:
-    """stdout must be exactly one JSON object on one line."""
+def _one_json(stdout: bytes, keys: int = 1) -> dict[str, Any]:
+    """stdout must be exactly one JSON object on one line, with ``keys`` keys (a session start
+    answers with up to three: its context, its date and its time zone)."""
     text = stdout.decode("utf-8")
     assert text and "\n" not in text.rstrip("\n"), text
     assert len(text.splitlines()) == 1, text
     parsed = json.loads(text)
-    assert isinstance(parsed, dict) and len(parsed) == 1, parsed
+    assert isinstance(parsed, dict) and len(parsed) == keys, parsed
     return parsed
 
 
@@ -264,11 +282,78 @@ def test_post_a_printed_secret_is_a_note(capfd: pytest.CaptureFixture[str]) -> N
 def test_session_context_shape(monkeypatch: pytest.MonkeyPatch,
                                capfd: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setattr(context, "build_session", lambda event: "SESSION-CTX")
-    assert _one_json(_main("session", _payload("session", R), capfd).encode()) == {
-        "context": "SESSION-CTX"
+    assert _one_json(_main("session", _payload("session", R), capfd).encode(), keys=3) == {
+        "context": "SESSION-CTX", "date": config.now_local().date().isoformat(),
+        "timezone": "Europe/London",
     }
     monkeypatch.setattr(context, "build_session", lambda event: "")
     assert _main("session", _payload("session", R), capfd) == ""  # never {"context": ""}
+
+
+def test_session_date_is_the_london_date_not_the_utc_one(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    # 23:30 UTC on 1 July is 00:30 BST on 2 July: the London day has already turned.
+    instant = datetime(2026, 7, 1, 23, 30, tzinfo=UTC).astimezone(ZoneInfo("Europe/London"))
+    monkeypatch.setattr(config, "now_local", lambda: instant)
+    monkeypatch.setattr(context, "build_session", lambda event: "SESSION-CTX")
+    out = _one_json(_main("session", _payload("session", R), capfd).encode(), keys=3)
+    assert out["date"] == "2026-07-02"
+    assert out["timezone"] == "Europe/London"
+
+
+def test_session_with_an_unreadable_clock_still_answers_with_its_context(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    def broken() -> Any:
+        raise OSError("no clock")
+
+    monkeypatch.setattr(config, "now_local", broken)
+    monkeypatch.setattr(context, "build_session", lambda event: "SESSION-CTX")
+    assert _one_json(_main("session", _payload("session", R), capfd).encode()) == {
+        "context": "SESSION-CTX"
+    }
+
+
+def test_session_timezone_is_the_iana_zone_of_glitch_clock(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The plugin's day boundary follows the member's Glitch zone, not London's by assumption."""
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    instant = datetime(2026, 7, 2, 3, 30, tzinfo=UTC).astimezone(ZoneInfo("America/New_York"))
+    monkeypatch.setattr(config, "now_local", lambda: instant)
+    monkeypatch.setattr(context, "build_session", lambda event: "SESSION-CTX")
+    out = _one_json(_main("session", _payload("session", R), capfd).encode(), keys=3)
+    assert out == {"context": "SESSION-CTX", "date": "2026-07-01", "timezone": "America/New_York"}
+
+
+def test_session_timezone_is_left_out_when_not_an_iana_name(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """config's fallback is the machine's fixed offset (no IANA name): the key is omitted."""
+    from datetime import datetime, timedelta, timezone
+
+    instant = datetime(2026, 7, 2, 12, 0, tzinfo=timezone(timedelta(hours=2)))
+    monkeypatch.setattr(config, "now_local", lambda: instant)
+    monkeypatch.setattr(context, "build_session", lambda event: "SESSION-CTX")
+    out = _one_json(_main("session", _payload("session", R), capfd).encode(), keys=2)
+    assert out == {"context": "SESSION-CTX", "date": "2026-07-02"}
+
+
+def test_a_rebuild_that_fails_is_the_normal_error_label(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A refresh or compaction rebuild that cannot build answers with the error label, never an
+    empty context (the plugin keeps the previous text)."""
+    monkeypatch.setattr(codex_shared, "load_hook_module", lambda stem: None)
+    for extra in ({"refresh": True}, {"source": "compact"}):
+        out = _main("session", {**_payload("session", R), **extra}, capfd)
+        assert _one_json(out.encode()) == {"error": "session-start-context unavailable"}
 
 
 def test_session_real_delegate_emits_the_identity(
@@ -276,8 +361,9 @@ def test_session_real_delegate_emits_the_identity(
 ) -> None:
     monkeypatch.delenv("CODEX_INVOKED_BY", raising=False)
     monkeypatch.setenv(context.NO_KEEPER_ENV, "1")
-    text = _one_json(_main("session", _payload("session", R), capfd).encode())["context"]
-    assert "## Who you are working with" in text
+    out = _one_json(_main("session", _payload("session", R), capfd).encode(), keys=3)
+    assert "## Who you are working with" in out["context"]
+    assert out["date"] == config.now_local().date().isoformat()
 
 
 def test_session_for_a_sub_agent_prints_nothing(capfd: pytest.CaptureFixture[str]) -> None:
@@ -337,3 +423,264 @@ def test_a_delegate_that_calls_exit_is_an_error(monkeypatch: pytest.MonkeyPatch,
 
     monkeypatch.setattr(pretool, "judge", bail)
     assert _one_json(_main("pre", _pre("ls"), capfd).encode()) == {"error": "SystemExit"}
+
+
+# --- capture -----------------------------------------------------------------------------------
+# The bridge answer per capture outcome (opencode_bridge.CAPTURE_SILENT / CAPTURE_ERRORS):
+# silence for a stage, a rightful skip or a transient miss; a capture-* error label for a chat
+# that could not be kept and for an internal fault.
+
+CAP_SID = "ses_capEntry0001"
+
+EXPECTED_ANSWER: dict[str, str | None] = {
+    capture.OUT_STAGED: None,
+    capture.OUT_TOO_SHORT: None,
+    capture.OUT_UNCHANGED: None,
+    capture.OUT_BEFORE: None,
+    capture.OUT_COLD_START: None,
+    capture.OUT_NOT_FOUND: None,
+    capture.OUT_UNREACHABLE: None,
+    capture.OUT_BUSY: None,
+    capture.OUT_DEFERRED: None,
+    capture.SKIP_CHILD: None,
+    capture.SKIP_AUTOMATED: None,
+    capture.SKIP_OUTSIDE: None,
+    capture.SKIP_OTHER_ROOT: None,
+    capture.SKIP_BAD_ID: None,
+    capture.OUT_REFUSED: "capture-refused",
+    capture.OUT_COPY_FAILED: "capture-copy-failed",
+    capture.OUT_STUB_FAILED: "capture-stub-failed",
+    capture.OUT_ERROR: "capture-error",
+    capture.OUT_UNREACHABLE_STREAK: "capture-unreachable",
+}
+
+
+def _cap(reason: str = "turn", sid: str = CAP_SID, **extra: Any) -> dict[str, Any]:
+    return {"session_id": sid, "session_dir": R, "reason": reason, **extra}
+
+
+def _stamp_ledger() -> None:
+    """A steady-state ledger (first run already happened), written where the child will read it."""
+    capture.save_ledger({"version": 1, "first_run": config.now_local().isoformat(),
+                         "sessions": {}, "refused": {}})
+
+
+def _stubs() -> list[Path]:
+    return sorted(chatcache.state_roots().pending.glob("*.md"))
+
+
+@pytest.fixture
+def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Fake:
+    root = tmp_path / "fake bin"
+    root.mkdir()
+    return Fake(root, monkeypatch)
+
+
+def test_every_capture_outcome_constant_has_a_mapping() -> None:
+    """Every OUT_* / SKIP_* label capture.py defines is classified, and classified as expected."""
+    defined = {v for k, v in vars(capture).items()
+               if k.startswith(("OUT_", "SKIP_")) and isinstance(v, str)}
+    assert defined == set(EXPECTED_ANSWER)
+    for outcome, label in EXPECTED_ANSWER.items():
+        want = None if label is None else {"error": label}
+        assert opencode_bridge.capture_answer(outcome) == want, outcome
+
+
+def test_an_unknown_capture_outcome_is_loud(monkeypatch: pytest.MonkeyPatch,
+                                            capfd: pytest.CaptureFixture[str]) -> None:
+    assert opencode_bridge.capture_answer("something new") == {"error": "capture-unknown-outcome"}
+    monkeypatch.setattr(capture, "capture_payload", lambda event: "something new")
+    assert _one_json(_main("capture", _cap(), capfd).encode()) == {
+        "error": "capture-unknown-outcome"
+    }
+
+
+@pytest.mark.parametrize("outcome", sorted(EXPECTED_ANSWER))
+def test_capture_mode_answers_each_outcome(outcome: str, monkeypatch: pytest.MonkeyPatch,
+                                           capfd: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(capture, "capture_payload", lambda event: outcome)
+    out = _main("capture", _cap(), capfd)
+    label = EXPECTED_ANSWER[outcome]
+    if label is None:
+        assert out == ""
+    else:
+        assert _one_json(out.encode()) == {"error": label}
+
+
+# Through the real bridge in a fresh interpreter, a fake opencode behind GLITCH_OPENCODE_BIN.
+
+
+def test_capture_subprocess_stages_a_grown_chat_silently(fake: Fake) -> None:
+    _stamp_ledger()
+    fake.chat(CAP_SID, 9, _new_ms())
+    done = _spawn("capture", _cap())
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == b""
+    assert [p.name for p in _stubs()] == [capture.stub_name(CAP_SID)]
+    assert any("opencode-capture" in line and "staged" in line for line in _log_lines())
+
+
+def test_capture_subprocess_cold_start_is_silent_and_stamps(fake: Fake) -> None:
+    fake.chat(CAP_SID, 9, _new_ms())
+    done = _spawn("capture", _cap())
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == b""
+    assert _stubs() == []
+    assert capture.load_ledger()["sessions"][CAP_SID]["note"] == capture.NOTE_FIRST_CHAT
+
+
+def test_d1_first_chat_after_install_through_the_bridge(
+    fake: Fake, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The measured sequence (docs/api-findings.md items 18-23): a fresh install, the live chat's
+    startup `session` call (it sweeps), then its turn ends, each a `capture` call.
+
+    The session start runs through the bridge's own ``main()`` in-process: a fresh interpreter's
+    session start would write the real engine's state folder (no environment door, see the module
+    docstring). Every turn end runs through the real bridge in a fresh interpreter.
+    """
+    monkeypatch.delenv("CODEX_INVOKED_BY", raising=False)
+    monkeypatch.setenv(context.NO_KEEPER_ENV, "1")
+    assert not capture.ledger_path().exists()
+    start = int((config.now_local().timestamp() - 5) * 1000)  # created before the first-run stamp
+    fake.chat("ses_before_install", 9, 1577836800000)
+    fake.chat(CAP_SID, 1, start)
+    event = {"session_id": CAP_SID, "session_dir": R, "parent_id": "", "source": "startup",
+             "refresh": False}  # toBridgeSession's shape
+    out = _one_json(_main("session", event, capfd).encode(), keys=3)
+    assert "## Who you are working with" in out["context"]
+    sessions = capture.load_ledger()["sessions"]
+    assert sessions[CAP_SID]["note"] == capture.NOTE_FIRST_CHAT
+    assert sessions["ses_before_install"]["note"] == capture.NOTE_BEFORE_FIRST_SWEEP
+    for k in range(1, 6):
+        fake.chat(CAP_SID, 2 * k, start)
+        done = _spawn("capture", _cap())
+        assert done.returncode == 0, done.stderr
+        assert done.stdout == b""
+        assert bool(_stubs()) is (2 * k >= capture.MIN_TURNS_TO_STAGE), k
+    assert [p.name for p in _stubs()] == [capture.stub_name(CAP_SID)]
+    rec = capture.load_ledger()["sessions"][CAP_SID]
+    assert rec["note"] == capture.NOTE_STAGED and rec["turns"] == 10
+    assert chatcache.copy_path(CAP_SID).is_file()
+    fake.chat("ses_before_install", 30, 1577836800000)
+    done = _spawn("capture", _cap(sid="ses_before_install"))
+    assert done.returncode == 0 and done.stdout == b""
+    assert [p.name for p in _stubs()] == [capture.stub_name(CAP_SID)]
+
+
+@pytest.mark.parametrize(
+    ("setup", "event"),
+    [
+        ("short", {}),
+        ("not-held", {}),
+        ("unreachable", {}),
+        ("held", {"parent_id": "ses_parent"}),
+    ],
+    ids=["too-short", "not-found", "unreachable", "sub-agent"],
+)
+def test_capture_subprocess_quiet_outcomes(fake: Fake, setup: str, event: dict[str, Any]) -> None:
+    _stamp_ledger()
+    if setup == "short":
+        fake.chat(CAP_SID, 3, _new_ms())
+    elif setup == "unreachable":
+        fake.chat(CAP_SID, 9, _new_ms())
+        fake.mode("export", "exit")
+    elif setup == "held":
+        fake.chat(CAP_SID, 9, _new_ms())
+    done = _spawn("capture", _cap(**event))
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == b""
+    assert _stubs() == []
+
+
+def test_capture_subprocess_refused_chat_is_an_error_label(fake: Fake) -> None:
+    _stamp_ledger()
+    fake.raw(CAP_SID, "SECRET-CHAT-TEXT not json")
+    done = _spawn("capture", _cap())
+    assert done.returncode == 0, done.stderr
+    assert _one_json(done.stdout) == {"error": "capture-refused"}
+    assert b"SECRET-CHAT-TEXT" not in done.stdout
+    assert _stubs() == []
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"session_id": CAP_SID, "session_dir": R},  # no reason
+        {"session_id": CAP_SID, "session_dir": R, "reason": "SECRET-REASON"},
+        {"session_dir": R, "reason": "turn"},  # no session id
+        {"session_id": CAP_SID, "session_dir": R, "reason": "turn", "parent_id": 7},
+    ],
+    ids=["no-reason", "bad-reason", "no-session-id", "parent-not-a-string"],
+)
+def test_capture_subprocess_bad_payload_is_a_label_only(event: dict[str, Any]) -> None:
+    done = _spawn("capture", event)
+    assert done.returncode == 0, done.stderr
+    assert _one_json(done.stdout) == {"error": "capture-bad-payload"}
+    assert b"SECRET" not in done.stdout
+    assert all("SECRET-REASON" not in line for line in _log_lines())
+    assert _stubs() == []
+
+
+# In-process, for the failures a fresh interpreter cannot be steered into.
+
+
+def test_capture_copy_failed_is_an_error_label(fake: Fake, monkeypatch: pytest.MonkeyPatch,
+                                               capfd: pytest.CaptureFixture[str]) -> None:
+    _stamp_ledger()
+    fake.chat(CAP_SID, 9, _new_ms())
+
+    def refuse(*_a: Any, **_k: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(chatcache, "write_copy", refuse)
+    assert _one_json(_main("capture", _cap(), capfd).encode()) == {"error": "capture-copy-failed"}
+    assert _stubs() == []
+
+
+def test_capture_stub_failed_is_an_error_label(fake: Fake, monkeypatch: pytest.MonkeyPatch,
+                                               capfd: pytest.CaptureFixture[str]) -> None:
+    _stamp_ledger()
+    fake.chat(CAP_SID, 9, _new_ms())
+
+    def refuse(*_a: Any, **_k: Any) -> int:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(capture, "stage", refuse)
+    assert _one_json(_main("capture", _cap(), capfd).encode()) == {"error": "capture-stub-failed"}
+
+
+def test_capture_internal_error_is_an_error_label(monkeypatch: pytest.MonkeyPatch,
+                                                  capfd: pytest.CaptureFixture[str]) -> None:
+    def boom(*_a: Any) -> str:
+        raise RuntimeError("SECRET-DETAIL")
+
+    monkeypatch.setattr(capture, "_capture_one", boom)
+    out = _main("capture", _cap(), capfd)
+    assert _one_json(out.encode()) == {"error": "capture-error"}
+    assert "SECRET-DETAIL" not in out
+
+
+def test_capture_unreachable_three_in_a_row_is_an_error_label_once(
+    fake: Fake, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """B1: one unreachable OpenCode is silence (it closes); the third in a row is loud, once."""
+    _stamp_ledger()
+    fake.chat(CAP_SID, 9, _new_ms())
+    fake.mode("export", "exit")
+    answers = [_main("capture", _cap(), capfd) for _ in range(4)]
+    assert answers[0] == "" and answers[1] == ""
+    assert _one_json(answers[2].encode()) == {"error": "capture-unreachable"}
+    assert answers[3] == ""
+    fake.mode("export", "ok")
+    assert _main("capture", _cap(), capfd) == ""  # staged; the streak is over
+
+
+def test_capture_busy_ledger_is_silent(fake: Fake, monkeypatch: pytest.MonkeyPatch,
+                                       capfd: pytest.CaptureFixture[str]) -> None:
+    _stamp_ledger()
+    fake.chat(CAP_SID, 9, _new_ms())
+    monkeypatch.setattr(capture, "HOOK_LOCK_TIMEOUT", 0.2)
+    with shared.file_lock(capture.ledger_path(), timeout=5):
+        assert _main("capture", _cap(), capfd) == ""
+    assert _stubs() == []

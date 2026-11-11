@@ -144,7 +144,10 @@ def log(label: str, tool: str, status: str, started: float, detail: str = "") ->
         from shared import log_hook_execution
 
         log_hook_execution(label, tool, status, time.time() - started, detail)
-    except Exception:  # noqa: BLE001 - logging is best-effort only
+    # This IS the log: a failure here (engine absent, or its writer raising anything) has nowhere
+    # to be logged, and logging it would recurse. Fail open silently so a hook never crashes on
+    # its own bookkeeping; ``Exception`` is the narrowest true type (import or arbitrary write error).
+    except Exception:  # noqa: BLE001, S110 - an unlogged logger failure cannot be logged
         pass
 
 

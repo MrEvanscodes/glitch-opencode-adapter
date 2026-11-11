@@ -45,7 +45,11 @@ DEFAULT_NAME = "opencode.json"
 PLUGIN_KEYS = ("plugins", "plugin")
 INSERT_KEY = "plugins"
 BACKUP_DIR_NAME = "glitch-opencode-backups"
-STALE_SUFFIX = "/opencode-adapter/src/plugin"
+# An entry ending in one of these, and not this checkout's own path, is this plugin at an older
+# location: the Glitch workspace name, and the folder name README step 2 tells a member to use.
+# (The README name was missing, so a moved member checkout was read as an unrelated plugin and
+# install loaded a second copy beside it.)
+STALE_SUFFIXES = ("/opencode-adapter/src/plugin", "/glitch-opencode-adapter/src/plugin")
 
 _LITERAL_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null")
 
@@ -221,7 +225,7 @@ def is_stale(value: object, plugin_dir: Path) -> bool:
     if not isinstance(value, str) or not value or is_ours(value, plugin_dir):
         return False
     shape = value.replace("\\", "/").rstrip("/").lower()
-    return shape.endswith(STALE_SUFFIX)
+    return shape.endswith(STALE_SUFFIXES)
 
 
 def _newline(text: str) -> str:
@@ -481,10 +485,15 @@ def cmd_uninstall(config_dir: Path, plugin_dir: Path, dry_run: bool) -> int:
         cfg.unlink()
     else:
         _atomic_write(cfg, after)
-    if read_text(cfg) != after or classify(config_dir, plugin_dir)[0] != "not-installed":
+    # A byte-for-byte restore may bring back an older checkout's entry that install had repointed:
+    # that is the member's own original file, so the check is "this checkout no longer named".
+    state = classify(config_dir, plugin_dir)[0]
+    if read_text(cfg) != after or state == "installed":
         print(f"error: {cfg} did not verify after uninstall", file=sys.stderr)
         return 1
     print(f"uninstalled: {how}; verified")
+    if state == "installed-stale-path":
+        print("note: the restored file names an older copy of this plugin, as it did before install")
     print(_diff(cfg, current, after), end="")
     return 0
 

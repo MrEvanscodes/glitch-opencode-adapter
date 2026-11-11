@@ -1,1 +1,17 @@
 cache-dir = ".cache/ruff"
+
+# The import-order answer must not depend on the folder ruff is run from. With --config, ruff takes
+# the cwd as the project root, and every relative `src` entry (the default [".", "src"] included)
+# is resolved against that cwd: run from .claude/scripts, the engine's modules read as first-party;
+# run from here, the bridge's do. So no folder decides it: `src` is empty and the first-party
+# modules are named. First-party: the bridge (src/bridge), the scripts and the test
+# modules (conftest, test_*). The Glitch engine's modules (config, shared, ...) are third-party
+# everywhere.
+# A new module in src/bridge or scripts is added to this list.
+src = []
+
+[lint.isort]
+known-first-party = [
+    "capture", "chatcache", "chatsource", "common", "context", "opencode_bridge", "posttool",
+    "pretool", "install", "conftest", "test_*",
+]

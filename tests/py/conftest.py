@@ -25,10 +25,32 @@ Two jobs:
    - Keeper state: ``config.RUN_LEDGER_FILE`` (re-exported as ``run_ledger.RUN_LEDGER_FILE``),
      ``config.KEEPER_HEALTH_FILE`` (the miss counter ``consolidate.note_miss`` writes, imported by
      value into ``consolidate``), ``config.KEEPER_BRIEF_FILE``, ``config.KEEPER_RUN_RECORD_FILE``.
+   - OpenCode capture state (fixture ``_isolate_opencode_capture``): ``GLITCH_OPENCODE_CAPTURE_STATE``
+     is set per test to a fresh folder under the system temp folder (the bridge's
+     ``chatcache.state_roots()`` reads it at call time and answers ``<it>/pending``, ``<it>/state``,
+     ``<it>/data``; a child inherits it), and ``config.PENDING_DIR`` / ``config.DATA_DIR`` are
+     moved to ``<it>/pending`` / ``<it>/data`` for the in-process (env unset) path.
+     ``config.STATE_DIR`` stays at the per-test ``<glitch-state>/engine-state`` set above (an
+     existing test pins that folder), so with the env unset the ledger lands there: still temp.
+     Any by-value copies named ``PENDING_DIR`` / ``STATE_DIR`` / ``DATA_DIR`` on an already-imported
+     ``capture`` or ``chatcache`` module are moved to the ``<it>`` sub folders.
+   - OpenCode's own home (fixture ``_isolate_opencode_home``): ``XDG_DATA_HOME``,
+     ``XDG_STATE_HOME``, ``XDG_CACHE_HOME``, ``XDG_CONFIG_HOME`` and ``OPENCODE_CONFIG_DIR`` point
+     at per-test temp folders and ``OPENCODE_DISABLE_AUTOUPDATE=1``, so no test, sweep or child
+     ``opencode`` reads the member's real OpenCode store (like ``CODEX_HOME`` above).
+
+3. The real-state guard (fixture ``_real_capture_state_unchanged``, autouse, set up before every
+   isolation door and checked after they are undone): it fingerprints the REAL pending queue, the
+   REAL ledger ``opencode-staged.json`` and the REAL ``opencode-chats`` folder (paths taken from
+   ``config`` at conftest import, before any patching) and fails the test, naming which one moved,
+   if any of them changed.
+   A live Glitch session staging a flush into the real queue during the same second would also
+   trip it; rerun, and if it repeats it is the test.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -49,7 +71,7 @@ BRIDGE_DIR = WORKSPACE / "src" / "bridge"
 if str(BRIDGE_DIR) not in sys.path:
     sys.path.insert(0, str(BRIDGE_DIR))
 
-import common  # noqa: E402  (bridge dir must be on the path first)
+import common  # (bridge dir must be on the path first)
 
 _root = common.resolve_root(WORKSPACE)
 if _root is None:  # pragma: no cover - the suite only runs inside a Glitch folder
@@ -85,8 +107,132 @@ for _marker in (
 
 common.engine_on_path(GLITCH_ROOT)
 
-import config  # noqa: E402  (engine import must follow the env pins above)
-import shared  # noqa: E402
+import config  # (engine import must follow the env pins above)
+import shared
+
+# --- The REAL capture state, captured BEFORE any fixture patches config ---------------------------
+CAPTURE_STATE_ENV = "GLITCH_OPENCODE_CAPTURE_STATE"
+REAL_PENDING_DIR = Path(config.PENDING_DIR)
+REAL_LEDGER_FILE = Path(config.STATE_DIR) / "opencode-staged.json"
+REAL_CHATS_DIR = Path(config.DATA_DIR) / "opencode-chats"
+_BIG_FILE_BYTES = 5 * 1024 * 1024
+_SYS_TEMP = Path(os.path.realpath(tempfile.gettempdir()))
+
+
+def fingerprint(target: Path) -> str:
+    """Return a sha256 fingerprint of a file or folder tree, or ``"absent"``.
+
+    Hashes each file's relative path and bytes; a file over 5 MB is hashed by size and mtime
+    instead, so the guard stays cheap on a large queue.
+    """
+    if not target.exists():
+        return "absent"
+    digest = hashlib.sha256()
+    files = [target] if target.is_file() else sorted(p for p in target.rglob("*") if p.is_file())
+    for path in files:
+        rel = "." if path == target else path.relative_to(target).as_posix()
+        digest.update(rel.encode("utf-8") + b"\0")
+        try:
+            stat = path.stat()
+            if stat.st_size > _BIG_FILE_BYTES:
+                digest.update(f"big:{stat.st_size}:{stat.st_mtime_ns}".encode())
+            else:
+                digest.update(path.read_bytes())
+        except OSError as exc:  # vanished mid-walk: still a difference worth seeing
+            digest.update(f"unreadable:{type(exc).__name__}".encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _real_capture_targets() -> dict[str, Path]:
+    return {
+        "real pending queue": REAL_PENDING_DIR,
+        "real ledger opencode-staged.json": REAL_LEDGER_FILE,
+        "real opencode-chats folder": REAL_CHATS_DIR,
+    }
+
+
+@pytest.fixture(autouse=True)
+def _real_capture_state_unchanged() -> Iterator[None]:
+    """Fail any test that changed the real pending queue, ledger or chat copies."""
+    targets = _real_capture_targets()
+    before = {name: fingerprint(path) for name, path in targets.items()}
+    yield
+    changed = [
+        f"{name} ({path})"
+        for name, path in targets.items()
+        if fingerprint(path) != before[name]
+    ]
+    if changed:
+        pytest.fail(
+            "this test changed the member's REAL OpenCode capture state: "
+            + "; ".join(changed)
+            + ". Route the write through chatcache.state_roots() / the patched config dirs.",
+            pytrace=False,
+        )
+
+
+def _under_sys_temp(path: Path) -> bool:
+    real = Path(os.path.realpath(path))
+    return real == _SYS_TEMP or _SYS_TEMP in real.parents
+
+
+@pytest.fixture(autouse=True)
+def _isolate_opencode_capture(
+    _real_capture_state_unchanged: None,
+    _isolate_machine_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Path]:
+    """Point the capture code's three folders (pending, state, data) at a per-test temp folder.
+
+    Requests ``_isolate_machine_state`` so its ``config.STATE_DIR`` move is overridden here, and
+    the real-state guard so that guard checks only after every patch is undone.
+    Yields the capture root; its ``pending`` / ``state`` / ``data`` sub folders exist.
+    """
+    root = Path(os.path.realpath(tmp_path_factory.mktemp("opencode-capture")))
+    if not _under_sys_temp(root):  # e.g. --basetemp outside the temp folder: the door would refuse
+        root = Path(os.path.realpath(tempfile.mkdtemp(prefix="opencode-bridge-test-capture-")))
+    assert _under_sys_temp(root), f"capture test root {root} is not under {_SYS_TEMP}"
+    dirs = {"PENDING_DIR": root / "pending", "STATE_DIR": root / "state", "DATA_DIR": root / "data"}
+    for folder in dirs.values():
+        folder.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv(CAPTURE_STATE_ENV, str(root))
+    # config.STATE_DIR keeps the per-test ``<glitch-state>/engine-state`` that
+    # ``_isolate_machine_state`` set (test_posttool asserts that exact folder); PENDING_DIR and
+    # DATA_DIR, copied by value at engine import, are moved here.
+    assert _under_sys_temp(Path(config.STATE_DIR)), f"config.STATE_DIR {config.STATE_DIR} not moved"
+    monkeypatch.setattr(config, "PENDING_DIR", dirs["PENDING_DIR"])
+    monkeypatch.setattr(config, "DATA_DIR", dirs["DATA_DIR"])
+    # By-value copies on the capture modules, only if a test already imported them.
+    for mod_name in ("capture", "chatcache"):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        for name, folder in dirs.items():
+            if hasattr(mod, name):
+                monkeypatch.setattr(mod, name, folder)
+    yield root
+
+
+@pytest.fixture(autouse=True)
+def _isolate_opencode_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Path]:
+    """Point OpenCode's config/data/state/cache homes at a per-test temp folder."""
+    home = tmp_path_factory.mktemp("opencode-home")
+    for env, sub in (
+        ("XDG_DATA_HOME", "xdg-data"),
+        ("XDG_STATE_HOME", "xdg-state"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_CONFIG_HOME", "xdg-config"),
+        ("OPENCODE_CONFIG_DIR", "opencode-config"),
+    ):
+        (home / sub).mkdir()
+        monkeypatch.setenv(env, str(home / sub))
+    monkeypatch.setenv("OPENCODE_DISABLE_AUTOUPDATE", "1")
+    yield home
 
 
 @pytest.fixture(autouse=True)

@@ -9,8 +9,13 @@ import {
   toBridgePost,
   toBridgeSession,
   toBridgePrompt,
+  toBridgeCapture,
   appendNoteToResult,
   pushContext,
+  localDay,
+  sessionResultOf,
+  sourceForFirstContext,
+  sessionHadHistory,
 } from "../../src/plugin/translate.ts";
 import type { ExecuteBeforeEvent, ExecuteAfterEvent, ContextEvent } from "../../src/plugin/translate.ts";
 
@@ -123,8 +128,77 @@ test("toBridgePre tolerates a missing input and a string input", () => {
 });
 
 test("toBridgeSession", () => {
-  assert.deepEqual(toBridgeSession("ses_1", SESSION_DIR), { session_id: "ses_1", session_dir: SESSION_DIR, parent_id: "" });
-  assert.deepEqual(toBridgeSession("ses_2", SESSION_DIR, "ses_1"), { session_id: "ses_2", session_dir: SESSION_DIR, parent_id: "ses_1" });
+  assert.deepEqual(toBridgeSession("ses_1", SESSION_DIR), {
+    session_id: "ses_1",
+    session_dir: SESSION_DIR,
+    parent_id: "",
+    source: "startup",
+    refresh: false,
+  });
+  assert.deepEqual(toBridgeSession("ses_2", SESSION_DIR, "ses_1"), {
+    session_id: "ses_2",
+    session_dir: SESSION_DIR,
+    parent_id: "ses_1",
+    source: "startup",
+    refresh: false,
+  });
+  assert.deepEqual(toBridgeSession("ses_3", SESSION_DIR, undefined, "compact", true), {
+    session_id: "ses_3",
+    session_dir: SESSION_DIR,
+    parent_id: "",
+    source: "compact",
+    refresh: true,
+  });
+  assert.equal(toBridgeSession("s", SESSION_DIR, "", "resume").source, "resume");
+});
+
+test("sourceForFirstContext: more than one message at the first call is a resume; otherwise startup", () => {
+  assert.equal(sourceForFirstContext({ sessionID: "s", messages: [{ role: "user" }] } as ContextEvent), "startup");
+  assert.equal(sourceForFirstContext({ sessionID: "s", messages: [{}, {}, {}] } as ContextEvent), "resume");
+  assert.equal(sourceForFirstContext({ sessionID: "s", messages: [] } as ContextEvent), "startup");
+  assert.equal(sourceForFirstContext({ sessionID: "s" } as ContextEvent), "startup", "no messages field: cannot tell");
+  assert.equal(sourceForFirstContext({ sessionID: "s", messages: "x" } as unknown as ContextEvent), "startup");
+  assert.equal(sourceForFirstContext(null), "startup");
+});
+
+test("sourceForFirstContext: ONE message plus the session.get history marker is a resume (post-compaction, items 22/25)", () => {
+  const one = { sessionID: "s", messages: [{ role: "user" }] } as ContextEvent;
+  assert.equal(sourceForFirstContext(one, true), "resume");
+  assert.equal(sourceForFirstContext(one, false), "startup");
+  assert.equal(sourceForFirstContext(one), "startup", "no marker given: the old rule");
+  assert.equal(sourceForFirstContext({ sessionID: "s" } as ContextEvent, true), "resume");
+  assert.equal(sourceForFirstContext({ sessionID: "s", messages: [{}, {}, {}] } as ContextEvent, false), "resume");
+});
+
+test("sessionHadHistory: the measured `outcome` key marks a session with history; anything else does not", () => {
+  // Key sets measured in the author's private test evidence (row 1 new, row 5 turn 2).
+  const fresh = { id: "s", projectID: "p", model: {}, cost: 0, tokens: {}, time: {}, location: { directory: "/x" } };
+  assert.equal(sessionHadHistory(fresh), false);
+  assert.equal(sessionHadHistory({ ...fresh, outcome: "succeeded" }), true);
+  assert.equal(sessionHadHistory({ ...fresh, title: "t" }), false, "title alone is not the marker");
+  assert.equal(sessionHadHistory({ ...fresh, outcome: null }), false);
+  assert.equal(sessionHadHistory({ ...fresh, outcome: undefined }), false);
+  assert.equal(sessionHadHistory(null), false);
+  assert.equal(sessionHadHistory(undefined), false);
+  assert.equal(sessionHadHistory("x"), false);
+});
+
+test("sessionResultOf reads context, a well-formed date, and an optional timezone", () => {
+  assert.deepEqual(sessionResultOf({ context: "T", date: "2026-11-11" }), { text: "T", date: "2026-11-11", timezone: null });
+  assert.deepEqual(sessionResultOf({ context: "T" }), { text: "T", date: null, timezone: null });
+  assert.deepEqual(sessionResultOf({ context: "T", date: "11/11/2026" }), { text: "T", date: null, timezone: null });
+  assert.deepEqual(sessionResultOf({ date: "2026-11-11", timezone: "Asia/Tokyo" }), { text: "", date: "2026-11-11", timezone: "Asia/Tokyo" });
+  assert.deepEqual(sessionResultOf(null), { text: "", date: null, timezone: null });
+});
+
+test("localDay formats the calendar day in the given zone, null for an unknown zone", () => {
+  // 2026-11-11T23:30Z is still the 11th in London (GMT) but already the 12th in Tokyo.
+  const t = Date.UTC(2026, 10, 11, 23, 30);
+  assert.equal(localDay(t, "Europe/London"), "2026-11-11");
+  assert.equal(localDay(t, "Asia/Tokyo"), "2026-11-12");
+  // British Summer Time: 2026-07-01T23:30Z is 00:30 on the 2nd in London.
+  assert.equal(localDay(Date.UTC(2026, 6, 1, 23, 30), "Europe/London"), "2026-07-02");
+  assert.equal(localDay(t, "Not/AZone"), null);
 });
 
 test("toBridgePrompt maps the measured session.prompt event", () => {
@@ -199,4 +273,19 @@ test("pushContext with only the claude-agent channel present", () => {
   const ev: ContextEvent = { options: { claudeCodeInstructions: "" } };
   pushContext(ev, "CTX");
   assert.equal(ev.options?.claudeCodeInstructions, "\n\nCTX");
+});
+
+// CP4: capture
+for (const reason of ["turn", "compact", "start", "sweep"] as const) {
+  test(`toBridgeCapture builds the ${reason} payload`, () => {
+    const p = toBridgeCapture("ses_x", SESSION_DIR, undefined, reason);
+    assert.deepEqual(p, { session_id: "ses_x", session_dir: SESSION_DIR, parent_id: "", reason });
+    assert.ok(!("turns" in p), "no turns: the bridge reads the chat through the export CLI");
+  });
+}
+
+test("toBridgeCapture keeps a parent id, and null/undefined become empty", () => {
+  assert.equal(toBridgeCapture("c", SESSION_DIR, "ses_p", "turn").parent_id, "ses_p");
+  assert.equal(toBridgeCapture("c", SESSION_DIR, null, "turn").parent_id, "");
+  assert.equal(toBridgeCapture("c", SESSION_DIR, "", "compact").parent_id, "");
 });

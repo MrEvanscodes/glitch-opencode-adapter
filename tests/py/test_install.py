@@ -32,11 +32,70 @@ def _snapshot(d: Path) -> dict[str, bytes]:
     return {str(p.relative_to(d)): p.read_bytes() for p in d.rglob("*") if p.is_file()}
 
 
+# Only these names in the REAL config folder are ever read for content; everything else there
+# (auth, tokens, credentials, databases, the service file, backups) is fingerprinted by stat only.
+_REAL_CONTENT_NAMES = frozenset({*inst.CONFIG_NAMES, "config.json"})
+
+
+def real_fingerprint(d: Path) -> dict[str, tuple[str, object]]:
+    """The real config tree: sha256 of top-level config files, (size, mtime_ns) for every other
+    entry, and the entry kind, so an added, removed or rewritten entry anywhere shows. Never reads
+    a file whose name is not a config file name."""
+    import hashlib
+
+    if not d.exists():
+        return {}
+    out: dict[str, tuple[str, object]] = {".": ("dir", d.stat().st_mtime_ns)}
+    for p in d.rglob("*"):
+        rel = p.relative_to(d).as_posix()
+        st = p.lstat()
+        if p.is_symlink():
+            out[rel] = ("link", (st.st_size, st.st_mtime_ns))
+        elif p.is_dir():
+            out[rel] = ("dir", st.st_mtime_ns)
+        elif p.parent == d and p.name in _REAL_CONTENT_NAMES:
+            out[rel] = ("sha256", hashlib.sha256(p.read_bytes()).hexdigest())
+        else:
+            out[rel] = ("stat", (st.st_size, st.st_mtime_ns))
+    return out
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _real_config_untouched_by_module():
+    """The whole module, every test and every subprocess it starts, leaves the real folder as it was."""
+    before = real_fingerprint(REAL_CONFIG)
+    yield
+    assert real_fingerprint(REAL_CONFIG) == before, "this test module changed the real ~/.config/opencode"
+
+
 @pytest.fixture(autouse=True)
 def _real_config_untouched():
-    before = _snapshot(REAL_CONFIG)
+    before = real_fingerprint(REAL_CONFIG)
     yield
-    assert _snapshot(REAL_CONFIG) == before, "a test changed the real ~/.config/opencode"
+    assert real_fingerprint(REAL_CONFIG) == before, "a test changed the real ~/.config/opencode"
+
+
+def test_real_fingerprint_reads_only_config_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    d = tmp_path / "opencode"
+    (d / "sub").mkdir(parents=True)
+    (d / "opencode.json").write_text("{}")
+    for name in ("auth.json", "token.json", "credentials.json", "opencode.db", "service.json", "sub/opencode.json"):
+        (d / name).write_text("SECRET-NEVER-READ")
+    opened: list[str] = []
+    real_read = Path.read_bytes
+
+    def spy(self: Path) -> bytes:
+        if self.is_relative_to(d):
+            opened.append(self.relative_to(d).as_posix())
+        return real_read(self)
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "read_bytes", spy)
+        fp = real_fingerprint(d)
+    assert opened == ["opencode.json"]
+    assert fp["auth.json"][0] == "stat" and fp["sub/opencode.json"][0] == "stat"
+    (d / "token.json").write_text("SECRET-NEVER-READ-2")
+    assert real_fingerprint(d) != fp  # a change to a stat-only file still shows
 
 
 def run(*args: str, cfg_dir: Path) -> subprocess.CompletedProcess[str]:
@@ -198,9 +257,12 @@ def test_status_states(tmp_path: Path) -> None:
 def test_stale_path_repointed_and_uninstall_restores(tmp_path: Path) -> None:
     src = '{"plugins": ["C:\\\\old\\\\workspaces\\\\opencode-adapter\\\\src\\\\plugin"]}\n'
     d = _seed(tmp_path, src)
-    run("install", cfg_dir=d)
+    assert run("install", cfg_dir=d).returncode == 0
     assert (d / "opencode.json").read_text() == '{"plugins": [' + LIT + "]}\n"
-    run("uninstall", cfg_dir=d)
+    r = run("uninstall", cfg_dir=d)
+    # The restore is the member's original file; it used to exit 1 "did not verify" here.
+    assert r.returncode == 0, r.stderr
+    assert "byte for byte" in r.stdout and "older copy" in r.stdout
     assert (d / "opencode.json").read_text() == src
 
 
@@ -281,4 +343,95 @@ def test_default_config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
 def test_plugin_dir_is_the_adapter_plugin() -> None:
     assert PLUGIN.is_absolute()
     assert (PLUGIN / "index.ts").is_file()
-    assert PLUGIN.parts[-3:] == ("opencode-adapter", "src", "plugin")
+    # The Glitch workspace name, or the folder name the README tells a member to use.
+    assert PLUGIN.parts[-2:] == ("src", "plugin")
+    assert PLUGIN.parts[-3] in ("opencode-adapter", "glitch-opencode-adapter")
+
+
+# --- stale-path recognition: the two checkout names this plugin ships under -------------------------
+
+README_CHECKOUT = "/Users/someone/glitch-opencode-adapter/src/plugin"  # README step 2's folder name
+
+
+def test_own_path_is_never_stale() -> None:
+    assert inst.is_ours(str(PLUGIN), PLUGIN)
+    assert not inst.is_stale(str(PLUGIN), PLUGIN)
+    assert not inst.is_stale(str(PLUGIN) + "/", PLUGIN)
+    for name in ("opencode-adapter", "glitch-opencode-adapter"):
+        here = Path(f"/a/{name}/src/plugin")
+        assert not inst.is_stale(str(here), here)
+
+
+def test_readme_checkout_name_is_recognised_as_stale(tmp_path: Path) -> None:
+    """README step 2 names the folder glitch-opencode-adapter; a member who moved it (or ran the
+    install from the Glitch workspace afterwards) must get the old entry repointed, never a second
+    copy of the plugin loaded beside it."""
+    assert inst.is_stale(README_CHECKOUT, PLUGIN)
+    assert inst.is_stale("C:\\Users\\Jo\\glitch-opencode-adapter\\src\\plugin\\", PLUGIN)
+    src = '{\n  "plugins": ["' + README_CHECKOUT + '"]\n}\n'
+    d = _seed(tmp_path, src)
+    assert run("status", cfg_dir=d).stdout.splitlines()[0] == "installed-stale-path"
+    r = run("install", cfg_dir=d)
+    assert r.returncode == 0, r.stderr
+    assert (d / "opencode.json").read_text() == '{\n  "plugins": [' + LIT + "]\n}\n"
+    r = run("uninstall", cfg_dir=d)
+    assert r.returncode == 0 and "byte for byte" in r.stdout
+    assert (d / "opencode.json").read_text() == src
+
+
+def test_unrelated_lookalike_paths_are_not_stale() -> None:
+    for other in (
+        "/x/my-opencode-adapter/src/plugin",
+        "/x/opencode-adapter-fork/src/plugin",
+        "/x/opencode-adapter/src/plugins",
+        "/x/opencode-adapter/plugin",
+        "opencode-foo@1.2.3",
+    ):
+        assert not inst.is_stale(other, PLUGIN), other
+
+
+# --- the real config folder is touched only when nothing else is named -----------------------------
+
+
+def _run_env(*args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-I", str(SCRIPT), *args], capture_output=True, text=True,
+                          check=False, env=env)
+
+
+def _bare_env(home: Path) -> dict[str, str]:
+    import os
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("OPENCODE_", "XDG_"))}
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    return env
+
+
+def test_explicit_config_dir_never_touches_the_default_folder(tmp_path: Path) -> None:
+    """--config-dir (or OPENCODE_CONFIG_DIR) wins; the default folder under HOME is never created,
+    read or written. HOME is a fake here, so this cannot reach the real folder even on failure."""
+    home = tmp_path / "home"
+    default = home / ".config" / "opencode"
+    default.mkdir(parents=True)
+    (default / "opencode.json").write_text('{"theme": "dark"}\n')
+    before = _snapshot(default)
+    target = tmp_path / "chosen"
+    for cmd in (("install", "--dry-run"), ("install",), ("status",), ("install",), ("uninstall",)):
+        r = _run_env(*cmd, "--config-dir", str(target), env=_bare_env(home))
+        assert r.returncode == 0, r.stderr
+        assert str(default) not in r.stdout + r.stderr
+    env = _bare_env(home)
+    env["OPENCODE_CONFIG_DIR"] = str(tmp_path / "by-env")
+    assert _run_env("install", env=env).returncode == 0
+    assert LIT in (tmp_path / "by-env" / "opencode.json").read_text()
+    assert _snapshot(default) == before
+
+
+def test_default_folder_is_used_only_when_nothing_is_named(tmp_path: Path) -> None:
+    """With no flag and no env, the OS default (HOME/.config/opencode) is the target: README step 5
+    relies on this. Run against a fake HOME, never the real one."""
+    home = tmp_path / "home"
+    r = _run_env("install", "--dry-run", env=_bare_env(home))
+    assert r.returncode == 0, r.stderr
+    assert str(home / ".config" / "opencode" / "opencode.json") in r.stdout
+    assert not (home / ".config").exists()  # dry run: nothing created

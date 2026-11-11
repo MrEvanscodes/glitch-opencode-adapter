@@ -25,12 +25,12 @@ import types
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 import codex_shared
+import pytest
+import shared
+
 import common
 import pretool
-import shared
 from conftest import BRIDGE_DIR, GLITCH_ROOT, SCRIPTS_DIR
 
 # Loading an engine hook by path must not leave bytecode in the engine's own hooks folder.
@@ -43,7 +43,7 @@ SOUL = str(GLITCH_ROOT / "glitch-mem" / "Memory" / "SOUL.md")
 UNLOCK = "GLITCH_" + "ALLOW_CANARY"  # split so this file never carries the token whole
 _BOM = b"\xef\xbb\xbf"
 
-# The V4A patch OpenCode really sent (spike/evidence/execute-before.jsonl), with a protected path.
+# The V4A patch OpenCode really sent (the author's private test evidence), with a protected path.
 V4A_ADD = "*** Begin Patch\n*** Add File: CLAUDE.md\n+x\n*** End Patch"
 V4A_FULL = (
     "*** Begin Patch\n"
@@ -88,7 +88,6 @@ class _Recorder:
     def loader(self, stem: str) -> Any:
         def decide(inner: dict[str, Any]) -> None:
             self.calls.append((stem, inner))
-            return None
 
         return types.SimpleNamespace(decide=decide)
 

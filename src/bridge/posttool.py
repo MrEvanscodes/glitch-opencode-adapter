@@ -11,7 +11,7 @@ one module that owns them.
 It never blocks (the tool has already run) and it never reads ``input``: the member's own command
 line belongs to the inline-key guard, before the command runs.
 
-Where the text comes from (measured shapes, ``spike/evidence/execute-after.jsonl``):
+Where the text comes from (measured shapes, `the author's private test evidence`):
 
 - ``result.content[].text``: what the model actually sees, for every tool.
 - ``result.output``: the tool-specific object. A string is taken whole; an object or list is read

@@ -79,11 +79,28 @@ export type BridgePost = {
   session_dir: string;
 };
 
+/** Why the session text is being built (the bridge's `source`; it defaults to "startup"). */
+export type SessionSource = "startup" | "resume" | "compact";
+
+/**
+ * Bridge `session`: `{session_id, session_dir, parent_id, source, refresh}`.
+ * `source` is "resume" when the session already held history at its first `context` call in this
+ * process, "compact" after a compaction; `refresh` is true when a new local day may have started.
+ */
 export type BridgeSession = {
   session_id: string;
   session_dir: string;
   parent_id: string;
+  source: SessionSource;
+  refresh: boolean;
 };
+
+/**
+ * What a `session` answer carries: `{context, date?, timezone?}`, `date` being the engine's local
+ * build date "YYYY-MM-DD" and `timezone` the IANA name of the engine clock's zone that date is in
+ * (bridge-client.ts parseSession validates both; either is absent when the engine cannot say).
+ */
+export type BridgeSessionResult = { context?: string; date?: string; timezone?: string };
 
 export type BridgePrompt = {
   session_id: string;
@@ -92,8 +109,38 @@ export type BridgePrompt = {
   parent_id: string;
 };
 
+/** Why a capture runs (opencode_bridge.py / capture.py REASONS). The plugin sends turn and compact. */
+export type CaptureReason = "turn" | "compact" | "start" | "sweep";
+
+/**
+ * Bridge `capture`: `{session_id, session_dir, parent_id, reason}`. No `turns` field: the bridge
+ * reads the chat itself through `opencode session export` (CAPTURE_SOURCE=export-cli).
+ * `parent_id` is "" for a primary session (capture.py requires a string when present).
+ */
+export type BridgeCapture = {
+  session_id: string;
+  session_dir: string;
+  parent_id: string;
+  reason: CaptureReason;
+};
+
 // ---------------------------------------------------------------------------------------------
 // Mappers.
+
+/** A turn end or compaction for one session -> bridge `capture`. */
+export function toBridgeCapture(
+  sessionId: string,
+  sessionDir: string,
+  parentId: string | null | undefined,
+  reason: CaptureReason,
+): BridgeCapture {
+  return {
+    session_id: sessionId,
+    session_dir: sessionDir,
+    parent_id: typeof parentId === "string" ? parentId : "",
+    reason,
+  };
+}
 
 /** `execute.before` -> bridge `pre`. `tool_input` is the event's own `input`, untouched. */
 export function toBridgePre(ev: ExecuteBeforeEvent, sessionDir: string, parentId?: string): BridgePre {
@@ -118,9 +165,75 @@ export function toBridgePost(ev: ExecuteAfterEvent, sessionDir: string, _parentI
   };
 }
 
-/** First `context` call for a session id -> bridge `session`. */
-export function toBridgeSession(sessionId: string, sessionDir: string, parentId?: string): BridgeSession {
-  return { session_id: sessionId, session_dir: sessionDir, parent_id: parentId ?? "" };
+/** First `context` call for a session id (or a rebuild) -> bridge `session`. */
+export function toBridgeSession(
+  sessionId: string,
+  sessionDir: string,
+  parentId?: string,
+  source: SessionSource = "startup",
+  refresh = false,
+): BridgeSession {
+  return { session_id: sessionId, session_dir: sessionDir, parent_id: parentId ?? "", source, refresh: refresh === true };
+}
+
+/** True when a `context` event already carries earlier history (more than one message). */
+export function contextHasHistory(ev: ContextEvent | null | undefined): boolean {
+  const messages = (ev as { messages?: unknown } | null | undefined)?.messages;
+  return Array.isArray(messages) && messages.length > 1;
+}
+
+/**
+ * The history marker on a `ctx.session.get` answer (docs/api-findings.md 12b, measured in
+ * the author's private test evidence and events-turn-end.jsonl): a session that has finished at
+ * least one turn carries the key `outcome` (the store's `idle_outcome`, written at each turn end);
+ * a brand-new one does not (its keys are id, projectID, model, cost, tokens, time, location).
+ * Only the key's presence with a non-null value is read; its value's type was never measured.
+ * Anything else (no answer, not an object, no `outcome`) reads as "no history": the old behaviour.
+ */
+export function sessionHadHistory(info: unknown): boolean {
+  if (info === null || typeof info !== "object") return false;
+  const outcome = (info as { outcome?: unknown }).outcome;
+  return outcome !== undefined && outcome !== null;
+}
+
+/**
+ * The source for a session's FIRST `context` call in this process (docs/api-findings.md 12b, P3b):
+ * a resumed session arrives with its history already in `messages` (lengths 3, 5, 7... measured),
+ * a new one with just the member's first message (length 1). So more than one message = resume.
+ * After a compaction the host shows ONE message (summary folded in, items 22 and 25) although the
+ * chat has history, so `hadHistory` (the `session.get` marker, see sessionHadHistory) also means
+ * resume. When `messages` is missing or not an array and there is no marker, it says "startup".
+ */
+export function sourceForFirstContext(ev: ContextEvent | null | undefined, hadHistory = false): SessionSource {
+  return contextHasHistory(ev) || hadHistory === true ? "resume" : "startup";
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** `{text, date, timezone}` out of a `session` result object; anything malformed reads as absent. */
+export function sessionResultOf(result: unknown): { text: string; date: string | null; timezone: string | null } {
+  const r = (typeof result === "object" && result !== null ? result : {}) as BridgeSessionResult;
+  const text = typeof r.context === "string" ? r.context : "";
+  const date = typeof r.date === "string" && DATE_RE.test(r.date) ? r.date : null;
+  const timezone = typeof r.timezone === "string" && r.timezone !== "" ? r.timezone : null;
+  return { text, date, timezone };
+}
+
+/**
+ * The calendar day "YYYY-MM-DD" of `nowMs` in `timeZone`, or null when the zone is unknown to
+ * this runtime's Intl data (the caller then never refreshes on a day change).
+ */
+export function localDay(nowMs: number, timeZone: string): string | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(
+      new Date(nowMs),
+    );
+    const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
+    const day = `${get("year")}-${get("month")}-${get("day")}`;
+    return DATE_RE.test(day) ? day : null;
+  } catch {
+    return null;
+  }
 }
 
 /** `session.prompt` -> bridge `prompt`, with the member's raw text (`prompt.text`). */

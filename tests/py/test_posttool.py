@@ -1,7 +1,7 @@
 """Tests for ``posttool.py``: the OpenCode ``execute.after`` secret scan.
 
 Every result shape here is a REAL ``execute.after`` event captured in CP0
-(``fixtures/execute-after.jsonl``, copied verbatim from ``spike/evidence/``), cut to the bridge
+(``fixtures/execute-after.jsonl``, copied verbatim from the author's private test evidence), cut to the bridge
 payload the plugin sends: ``{tool_name, session_id, result, error, status}``.
 The delegate is the REAL ``post-tool-secret-guard`` unless a test says otherwise.
 """

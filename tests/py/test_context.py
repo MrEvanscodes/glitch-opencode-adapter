@@ -18,18 +18,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+import codex_identity  # (engine path is set by conftest)
+import config
 import pytest
+import read_grant
 
+import capture
+import chatcache
+import chatsource
 import common
 import context
-
-import codex_identity  # noqa: E402  (engine path is set by conftest)
-import config  # noqa: E402
-import read_grant  # noqa: E402
+from conftest import GLITCH_ROOT, WORKSPACE
+from test_capture import Fake, _new_ms
 
 _REAL_GRANT_FILE = read_grant.CLAUDE_DIR / "data" / "state" / "read-grant.json"
 
@@ -61,6 +67,13 @@ def _isolate_headsup(monkeypatch: pytest.MonkeyPatch) -> None:
     # The heads-up cadence file itself is moved by conftest; these are this file's own env pins.
     monkeypatch.delenv("CODEX_INVOKED_BY", raising=False)
     monkeypatch.delenv(context.NO_KEEPER_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_opencode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Every session start sweeps: it must never reach the real opencode. An absolute path to
+    nothing reads as "not installed"; the capture tests install the fake binary over it."""
+    monkeypatch.setenv(chatsource.BIN_ENV, str(tmp_path / "no-opencode-here"))
 
 
 @pytest.fixture
@@ -239,6 +252,257 @@ def test_session_fails_open_when_codex_session_will_not_load(
     monkeypatch.setattr(context, "hooks_dir", lambda: tmp_path / "no-hooks")
     assert context.session_context({"session_id": "ses_broken2"}) == ""
     assert any(s == "ERROR" for _l, _t, s, _d in logs)
+
+
+# --- session start: OpenCode's own capture sweep and notice ----------------------------------
+
+CAPTURED_LINE = "_1 OpenCode chat queued for your memory since last time._"
+CTX_SID = "ses_ctxCapture001"
+
+
+@pytest.fixture
+def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Fake:
+    root = tmp_path / "fake bin"
+    root.mkdir()
+    return Fake(root, monkeypatch)
+
+
+def _stamp_ledger() -> None:
+    capture.save_ledger({"version": 1, "first_run": config.now_local().isoformat(),
+                         "sessions": {}, "refused": {}})
+
+
+def test_notice_reports_a_chat_the_start_sweep_captured(vault: Path, fake: Fake) -> None:
+    _stamp_ledger()
+    fake.chat(CTX_SID, 9, _new_ms())
+    text = context.session_context({"session_id": "ses_start", "session_dir": "/x"})
+    assert CAPTURED_LINE in text
+    assert PERSONA_SENTINEL in text
+    assert fake.calls("list")  # the sweep ran, before the notice
+    # Reported once: the next start, with nothing new, says nothing about capture.
+    again = context.session_context({"session_id": "ses_start2"})
+    assert "OpenCode chat" not in again
+    assert PERSONA_SENTINEL in again
+
+
+def test_notice_is_silent_when_nothing_was_captured(vault: Path, fake: Fake) -> None:
+    _stamp_ledger()
+    text = context.session_context({"session_id": "ses_quiet"})
+    assert "OpenCode chat" not in text
+    assert PERSONA_SENTINEL in text
+    assert fake.calls("list")
+
+
+def test_notice_is_passed_as_a_callable_never_none(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+    real = context.load_codex_session
+
+    def spy_loader() -> Any:
+        module = real()
+        inner = module.build_context
+
+        def spy(*a: Any, **k: Any) -> Any:
+            seen.append(k.get("capture_notice"))
+            return inner(*a, **k)
+
+        monkeypatch.setattr(module, "build_context", spy)
+        return module
+
+    monkeypatch.setattr(context, "load_codex_session", spy_loader)
+    context.session_context({"session_id": "ses_callable"})
+    assert len(seen) == 1 and callable(seen[0])
+
+
+@pytest.mark.parametrize("how", ["parent", "glitch"])
+def test_automated_session_gets_no_notice_and_no_sweep(
+    vault: Path, fake: Fake, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    _stamp_ledger()
+    fake.chat(CTX_SID, 9, _new_ms())
+    notices: list[int] = []
+    monkeypatch.setattr(capture, "capture_notice", lambda: notices.append(1) or "")
+    event: dict[str, Any] = {"session_id": "ses_kid"}
+    if how == "parent":
+        event["parent_id"] = "ses_parent"
+    else:
+        monkeypatch.setenv("CODEX_INVOKED_BY", "glitch")
+    assert context.session_context(event) == ""
+    assert fake.calls() == []
+    assert notices == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"source": "compact"}, {"source": "resume"}, {"source": "COMPACT"}, {"refresh": True},
+     {"refresh": "true"}],
+    ids=["compact", "resume", "compact-upper", "refresh", "refresh-str"],
+)
+def test_refresh_or_compaction_rebuild_skips_the_sweep(
+    vault: Path, fake: Fake, extra: dict[str, Any]
+) -> None:
+    _stamp_ledger()
+    fake.chat(CTX_SID, 9, _new_ms())
+    text = context.session_context({"session_id": "ses_rebuild", **extra})
+    assert PERSONA_SENTINEL in text
+    assert fake.calls() == []
+    assert CAPTURED_LINE not in text
+
+
+@pytest.mark.parametrize(
+    "extra", [{"source": "startup"}, {"refresh": False}, {"source": ""}],
+    ids=["startup", "refresh-false", "empty-source"],
+)
+def test_a_normal_start_with_the_future_fields_still_sweeps(
+    vault: Path, fake: Fake, extra: dict[str, Any]
+) -> None:
+    _stamp_ledger()
+    context.session_context({"session_id": "ses_normal", **extra})
+    assert fake.calls("list")
+
+
+@pytest.mark.parametrize("sub", ["list", "export"])
+def test_a_stalled_opencode_still_returns_the_identity(
+    vault: Path, fake: Fake, monkeypatch: pytest.MonkeyPatch, sub: str,
+    logs: list[tuple[str, str, str, str]],
+) -> None:
+    _stamp_ledger()
+    fake.chat(CTX_SID, 9, _new_ms())
+    fake.mode(sub, "sleep")  # the fake sleeps 60 s
+    monkeypatch.setattr(context, "SESSION_SWEEP_READ_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(context, "SESSION_SWEEP_BUDGET_SECONDS", 2.0)  # room to START the read
+    began = time.monotonic()
+    text = context.session_context({"session_id": "ses_stall"})
+    elapsed = time.monotonic() - began
+    assert PERSONA_SENTINEL in text and USER_SENTINEL in text
+    assert CAPTURED_LINE not in text
+    assert elapsed < 15, elapsed  # one bounded read (+ the kill grace), never the fake's 60 s
+    assert ("opencode-session", "sweep", "ERROR") not in [(lb, t, s) for lb, t, s, _d in logs]
+
+
+def test_an_unreachable_opencode_still_returns_the_identity(vault: Path) -> None:
+    # The autouse fixture points the binary at nothing: "not installed".
+    _stamp_ledger()
+    text = context.session_context({"session_id": "ses_noopencode"})
+    assert PERSONA_SENTINEL in text
+
+
+def test_a_sweep_that_raises_still_returns_the_identity(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, logs: list[tuple[str, str, str, str]]
+) -> None:
+    def boom(**_k: Any) -> Any:
+        raise RuntimeError("SECRET-SWEEP-DETAIL")
+
+    monkeypatch.setattr(capture, "sweep", boom)
+    text = context.session_context({"session_id": "ses_boom"})
+    assert PERSONA_SENTINEL in text
+    assert (context.SESSION_LABEL, "sweep", "ERROR", "RuntimeError") in logs
+    assert all("SECRET" not in d for _l, _t, _s, d in logs)
+
+
+def test_a_notice_that_will_not_load_still_returns_the_identity(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A None entry makes `import capture` raise inside both guarded calls.
+    monkeypatch.setitem(sys.modules, "capture", None)
+    text = context.session_context({"session_id": "ses_nocapture"})
+    assert PERSONA_SENTINEL in text
+
+
+def test_the_sweep_runs_tightened_by_arguments_and_touches_no_global(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_before, read_before = capture.LOCK_TIMEOUT, chatsource.TIMEOUT_SECONDS
+    during: list[dict[str, Any]] = []
+
+    def spy(**kw: Any) -> capture.SweepResult:
+        during.append({**kw, "globals": (capture.LOCK_TIMEOUT, chatsource.TIMEOUT_SECONDS)})
+        raise RuntimeError("a fault costs the session nothing")
+
+    monkeypatch.setattr(capture, "sweep", spy)
+    text = context.session_context({"session_id": "ses_bounds"})
+    assert PERSONA_SENTINEL in text
+    assert during == [{
+        "budget_seconds": context.SESSION_SWEEP_BUDGET_SECONDS,
+        "live_session_id": "ses_bounds",
+        "lock_timeout": context.SESSION_SWEEP_LOCK_TIMEOUT_SECONDS,
+        "read_timeout": context.SESSION_SWEEP_READ_TIMEOUT_SECONDS,
+        "globals": (lock_before, read_before),  # untouched even while the sweep runs
+    }]
+    assert (capture.LOCK_TIMEOUT, chatsource.TIMEOUT_SECONDS) == (lock_before, read_before)
+    assert not hasattr(context, "_session_bounds")
+
+
+@pytest.mark.parametrize("sid", [None, "", 7])
+def test_a_start_with_no_usable_id_sweeps_with_no_live_id(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, sid: Any
+) -> None:
+    seen: list[Any] = []
+    monkeypatch.setattr(capture, "sweep", lambda **kw: seen.append(kw["live_session_id"]) or
+                        capture.SweepResult())
+    event: dict[str, Any] = {} if sid is None else {"session_id": sid}
+    context.session_context(event)
+    assert seen == [None]
+
+
+# --- D1: the first chat after install, through the real session start -----------------------------
+
+D1_LIVE = "ses_e348b7107ffeGc05JfJWoCx212"
+
+
+def test_d1_first_start_records_the_live_chat_then_its_turns_stage(
+    vault: Path, fake: Fake
+) -> None:
+    assert not capture.ledger_path().exists()  # fresh install
+    start = int((time.time() - 5) * 1000)  # created just before the first-run stamp
+    fake.chat("ses_before_install", 9, 1577836800000)
+    fake.chat(D1_LIVE, 1, start)
+    text = context.build_session({"session_id": D1_LIVE, "session_dir": "/x", "source": "startup"})
+    assert PERSONA_SENTINEL in text
+    notes = {k: v["note"] for k, v in capture.load_ledger()["sessions"].items()}
+    assert notes == {D1_LIVE: capture.NOTE_FIRST_CHAT,
+                     "ses_before_install": capture.NOTE_BEFORE_FIRST_SWEEP}
+    outcomes = []
+    for k in range(1, 6):
+        fake.chat(D1_LIVE, 2 * k, start)
+        outcomes.append(capture.capture_one(D1_LIVE, str(GLITCH_ROOT), "", "turn"))
+    assert outcomes == ["too short", "too short", "staged", "staged", "staged"]
+    assert capture.load_ledger()["sessions"][D1_LIVE]["note"] == capture.NOTE_STAGED
+    assert (chatcache.state_roots().pending / capture.stub_name(D1_LIVE)).is_file()
+    fake.chat("ses_before_install", 30, 1577836800000)
+    assert capture.capture_one("ses_before_install", str(GLITCH_ROOT), "", "turn") == (
+        capture.OUT_BEFORE)
+    # The next start reports the capture once.
+    assert CAPTURED_LINE in context.session_context({"session_id": "ses_next"})
+
+
+@pytest.mark.parametrize("how", ["parent", "glitch"])
+def test_d1_an_automated_first_start_never_sweeps_or_stamps(
+    vault: Path, fake: Fake, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    fake.chat(D1_LIVE, 1, _new_ms())
+    event: dict[str, Any] = {"session_id": D1_LIVE}
+    if how == "parent":
+        event["parent_id"] = "ses_parent"
+    else:
+        monkeypatch.setenv("CODEX_INVOKED_BY", "glitch")
+    assert context.session_context(event) == ""
+    assert fake.calls() == []
+    assert not capture.ledger_path().exists()
+
+
+def test_the_sweep_worst_case_fits_inside_the_plugin_session_timeout() -> None:
+    ts = (WORKSPACE / "src" / "plugin" / "bridge-client.ts").read_text(encoding="utf-8")
+    match = re.search(r"\bsession:\s*([\d_]+)", ts)
+    assert match is not None
+    session_ms = int(match.group(1).replace("_", ""))
+    worst = (
+        context.SESSION_SWEEP_LOCK_TIMEOUT_SECONDS
+        + context.SESSION_SWEEP_BUDGET_SECONDS
+        + context.SESSION_SWEEP_READ_TIMEOUT_SECONDS
+        + chatsource._KILL_GRACE_SECONDS
+    )
+    # Half the session's time at most: uv, the interpreter and the identity build need the rest.
+    assert worst <= session_ms / 1000 / 2, (worst, session_ms)
 
 
 # --- every prompt -----------------------------------------------------------------------------
@@ -429,3 +693,265 @@ def test_prompt_child_uses_this_interpreter(
     exe, keys = out.split("|")
     assert Path(exe).resolve() == Path(sys.executable).resolve()
     assert keys == "prompt,session_id"  # only the two keys the hook reads; no host markers
+
+
+# --- rebuilds: compaction, refresh, resume (engine #330) ---------------------------------------
+
+
+def _misses() -> int:
+    """The REAL keeper miss counter (``consolidate.note_miss`` writes it; conftest moves the file
+    to per-test state)."""
+    import consolidate
+
+    return int(consolidate.load_health()["misses"])
+
+
+def _spy_codex(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
+    """Wrap the loaded engine module's ``keeper_directive`` and ``build_context`` (both still run
+    for real), recording the ``count_miss`` and the ``source`` each was given."""
+    seen: dict[str, list[Any]] = {"count_miss": [], "source": []}
+    real = context.load_codex_session
+
+    def spy_loader() -> Any:
+        module = real()
+        real_directive = module.keeper_directive
+        real_build = module.build_context
+
+        def directive_spy(*a: Any, **k: Any) -> Any:
+            seen["count_miss"].append(k.get("count_miss", "absent"))
+            return real_directive(*a, **k)
+
+        def build_spy(event: dict[str, Any], *a: Any, **k: Any) -> Any:
+            seen["source"].append(event.get("source"))
+            return real_build(event, *a, **k)
+
+        monkeypatch.setattr(module, "keeper_directive", directive_spy)
+        monkeypatch.setattr(module, "build_context", build_spy)
+        return module
+
+    monkeypatch.setattr(context, "load_codex_session", spy_loader)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"source": "compact"}, {"source": "COMPACT"}, {"refresh": True}, {"refresh": "true"},
+     {"source": "resume", "refresh": True}],
+    ids=["compact", "compact-upper", "refresh", "refresh-str", "resume-refresh"],
+)
+def test_a_compact_or_refresh_rebuild_issues_the_directive_but_never_counts_a_miss(
+    vault: Path, keeper_pending: None, monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any]
+) -> None:
+    seen = _spy_codex(monkeypatch)
+    before = _misses()
+    text = context.session_context({"session_id": "ses_rebuild_keeper", **extra})
+    assert "## Memory\n" in text and "`subagent`" in text  # issued
+    assert _misses() == before  # the real counter did not move
+    assert seen["count_miss"] == [False]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"source": "startup"}, {"source": "resume"}, {"source": "garbage"}, {"source": 7},
+     {"refresh": False}, {"refresh": 1}, {"refresh": "yes"}, {"refresh": []}, {"refresh": None}],
+    ids=["plain", "startup", "resume", "unknown-source", "source-not-a-string", "refresh-false",
+         "refresh-int", "refresh-yes", "refresh-list", "refresh-null"],
+)
+def test_a_start_or_resume_counts_the_miss_as_before(
+    vault: Path, keeper_pending: None, monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any]
+) -> None:
+    seen = _spy_codex(monkeypatch)
+    before = _misses()
+    text = context.session_context({"session_id": "ses_start_keeper", **extra})
+    assert "## Memory\n" in text and PERSONA_SENTINEL in text
+    assert _misses() == before + 1  # the real counter moved by exactly one
+    assert seen["count_miss"] == [True]
+
+
+def test_the_real_counter_is_live_across_a_start_then_a_compaction(
+    vault: Path, keeper_pending: None
+) -> None:
+    """No spy: a real start counts, the real compaction after it does not."""
+    before = _misses()
+    context.session_context({"session_id": "ses_live"})
+    assert _misses() == before + 1
+    context.session_context({"session_id": "ses_live", "source": "compact"})
+    context.session_context({"session_id": "ses_live", "refresh": True})
+    assert _misses() == before + 1
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [({}, "startup"), ({"source": "startup"}, "startup"), ({"source": "resume"}, "resume"),
+     ({"source": "compact"}, "compact"), ({"source": " Compact "}, "compact"),
+     ({"refresh": True}, "startup"), ({"source": "compact", "refresh": True}, "compact"),
+     ({"source": "garbage"}, "startup"), ({"source": 7}, "startup"),
+     ({"source": "clear"}, "startup")],
+    ids=["absent", "startup", "resume", "compact", "compact-padded", "refresh",
+         "compact-refresh", "unknown", "not-a-string", "clear-not-ours"],
+)
+def test_the_source_reaches_build_context(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any], expected: str
+) -> None:
+    seen = _spy_codex(monkeypatch)
+    text = context.session_context({"session_id": "ses_source", **extra})
+    assert PERSONA_SENTINEL in text
+    assert seen["source"] == [expected]
+
+
+@pytest.mark.parametrize(
+    "extra", [{"refresh": 1}, {"refresh": "yes"}, {"refresh": []}, {"refresh": {"a": 1}},
+              {"source": "garbage"}],
+    ids=["refresh-int", "refresh-yes", "refresh-list", "refresh-dict", "unknown-source"],
+)
+def test_bad_values_are_a_normal_start_that_sweeps(
+    vault: Path, fake: Fake, extra: dict[str, Any]
+) -> None:
+    _stamp_ledger()
+    text = context.session_context({"session_id": "ses_badfields", **extra})
+    assert PERSONA_SENTINEL in text
+    assert fake.calls("list")
+
+
+@pytest.mark.parametrize("extra", [{"source": "compact"}, {"refresh": True}],
+                         ids=["compact", "refresh"])
+def test_a_sub_agent_rebuild_still_gets_nothing(
+    vault: Path, keeper_pending: None, fake: Fake, extra: dict[str, Any]
+) -> None:
+    before = _misses()
+    assert context.session_context(
+        {"session_id": "ses_kid", "parent_id": "ses_parent", **extra}) == ""
+    assert _misses() == before
+    assert fake.calls() == []
+
+
+# --- the Claude Code hand-off block ------------------------------------------------------------
+
+HANDOFF_FORBIDDEN_WORDS = ("engine", "bridge", "spine", "hook", "hooks", "plugin", "plugins")
+HANDOFF_FALSE_CLAIMS = (
+    "already saved", "already in your memory", "is in your memory", "are in your memory",
+    "has been saved", "have been saved", "was saved", "is saved", "already captured",
+)
+
+
+@pytest.mark.parametrize(
+    "extra", [{}, {"source": "startup"}, {"source": "resume"}],
+    ids=["plain", "startup", "resume"],
+)
+def test_handoff_appears_once_on_start_and_resume(vault: Path, extra: dict[str, Any]) -> None:
+    text = context.session_context({"session_id": "ses_handoff", **extra})
+    block = context.handoff_block()
+    assert text.count(block) == 1
+    assert text.count(context.HANDOFF_HEADING) == 1
+    assert text.endswith(block)  # after the engine context and the capture notice
+    assert text.index(IDENTITY_HEAD) < text.index(block)
+
+
+def test_handoff_follows_the_capture_notice(vault: Path, fake: Fake) -> None:
+    _stamp_ledger()
+    fake.chat(CTX_SID, 9, _new_ms())
+    text = context.session_context({"session_id": "ses_handoff_notice"})
+    assert text.index(CAPTURED_LINE) < text.index(context.HANDOFF_HEADING)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"source": "compact"}, {"source": "COMPACT"}, {"refresh": True}, {"refresh": "true"},
+     {"source": "resume", "refresh": True}],
+    ids=["compact", "compact-upper", "refresh", "refresh-str", "resume-refresh"],
+)
+def test_handoff_absent_on_compact_and_refresh(vault: Path, extra: dict[str, Any]) -> None:
+    text = context.session_context({"session_id": "ses_handoff_rebuild", **extra})
+    assert PERSONA_SENTINEL in text  # the rebuild still carries identity
+    assert context.HANDOFF_HEADING not in text
+    assert context.handoff_sentence() not in text
+
+
+@pytest.mark.parametrize("how", ["parent", "glitch"])
+def test_handoff_absent_for_automated_sessions(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    event: dict[str, Any] = {"session_id": "ses_handoff_kid"}
+    if how == "parent":
+        event["parent_id"] = "ses_parent"
+    else:
+        monkeypatch.setenv("CODEX_INVOKED_BY", "glitch")
+    assert context.session_context(event) == ""
+
+
+def test_handoff_sentence_has_no_internal_words() -> None:
+    words = set(re.findall(r"[a-z]+", context.handoff_sentence().lower()))
+    assert not words & set(HANDOFF_FORBIDDEN_WORDS), words & set(HANDOFF_FORBIDDEN_WORDS)
+
+
+def test_handoff_never_claims_a_chat_is_already_in_memory() -> None:
+    lowered = context.handoff_block().lower()
+    for phrase in HANDOFF_FALSE_CLAIMS:
+        assert phrase not in lowered, phrase
+    assert "saved to your memory as you go" in lowered
+
+
+def test_handoff_names_every_claude_code_only_extra_and_the_way_in() -> None:
+    sentence = context.handoff_sentence()
+    for extra in ("task and its project window", "mail count on the status line",
+                  "open task back up after a clear", "daily brief",
+                  "your profile being refreshed at the end of a session"):
+        assert extra in sentence, extra
+    assert "persona" not in sentence.lower() and "sync" not in sentence.lower()
+    assert "`claude`" in sentence and "Glitch folder" in sentence
+    assert context.HANDOFF_INTRO.startswith("If you haven't already, tell the member once")
+    assert "repeat" not in context.handoff_block().lower()
+
+
+def test_handoff_fits_its_budget(vault: Path) -> None:
+    with_block = context.session_context({"session_id": "ses_budget"})
+    without = context.session_context({"session_id": "ses_budget", "refresh": True})
+    assert PERSONA_SENTINEL in without and context.HANDOFF_HEADING not in without
+    assert len(context.handoff_block()) + 2 <= context.HANDOFF_BUDGET_CHARS
+    # The real delta (the rest of the text is the same build, minus the refresh-only differences).
+    assert with_block.endswith(context.handoff_block())
+    delta = len(with_block) - len(with_block[: -len(context.handoff_block())].rstrip())
+    assert delta <= context.HANDOFF_BUDGET_CHARS
+
+
+def test_handoff_count_tracks_the_capture_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drift note: the promise's number IS capture's floor, formatted in, never hard-coded."""
+    assert capture.MIN_TURNS_TO_STAGE == 5
+    assert "chats of five or more messages" in context.handoff_sentence()
+    assert "{count}" in context.HANDOFF_PROMISE and "five" not in context.HANDOFF_PROMISE
+    monkeypatch.setattr(capture, "MIN_TURNS_TO_STAGE", 7)
+    assert "chats of seven or more messages" in context.handoff_sentence()
+    monkeypatch.setattr(capture, "MIN_TURNS_TO_STAGE", 12)
+    assert "chats of 12 or more messages" in context.handoff_sentence()
+
+
+def test_handoff_that_will_not_build_still_returns_the_identity(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, logs: list[tuple[str, str, str, str]]
+) -> None:
+    def boom() -> str:
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(context, "handoff_block", boom)
+    text = context.session_context({"session_id": "ses_handoff_boom"})
+    assert PERSONA_SENTINEL in text
+    assert (context.SESSION_LABEL, "handoff", "ERROR", "RuntimeError") in logs
+
+
+def test_session_date_is_the_london_date_near_midnight(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    london = ZoneInfo("Europe/London")
+    # 23:30 UTC on 1 July is 00:30 BST on 2 July.
+    summer = datetime(2026, 7, 1, 23, 30, tzinfo=UTC)
+    monkeypatch.setattr(config, "now_local", lambda: summer.astimezone(london))
+    assert context.session_date() == "2026-07-02"
+    assert summer.date().isoformat() == "2026-07-01"  # the UTC day differs: the probe is live
+    # 23:59 GMT on 31 December is the same day in London and UTC.
+    winter = datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
+    monkeypatch.setattr(config, "now_local", lambda: winter.astimezone(london))
+    assert context.session_date() == "2026-12-31"
+
+
+def test_session_date_matches_glitch_clock() -> None:
+    assert context.session_date() == config.now_local().date().isoformat()
